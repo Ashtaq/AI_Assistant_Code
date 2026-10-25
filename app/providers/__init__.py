@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import time
+
 import httpx
 
 from ..config import Settings
@@ -9,14 +12,21 @@ from .anthropic import AnthropicProvider
 from .base import Completion, Provider, ProviderError
 from .openai_compat import OpenAICompatProvider
 
-__all__ = ["Completion", "Provider", "ProviderError", "build_providers"]
+__all__ = ["Completion", "Provider", "ProviderError", "build_providers", "warm_up_ollama"]
 
 
 def build_providers(settings: Settings, client: httpx.AsyncClient) -> tuple[Provider | None, Provider | None]:
     fast: Provider | None = None
     if settings.fast_provider == "ollama":
         fast = OpenAICompatProvider(
-            name="ollama", base_url=settings.ollama_base_url, model=settings.ollama_model, local=True, client=client, timeout=settings.timeout_seconds
+            name="ollama",
+            base_url=settings.ollama_base_url,
+            model=settings.ollama_model,
+            local=True,
+            client=client,
+            timeout=settings.ollama_timeout_seconds,
+            retry_timeouts=False,  # a slow local model will not get faster on a second try
+            no_think=not settings.ollama_think,
         )
     elif settings.fast_provider == "hosted":
         fast = OpenAICompatProvider(
@@ -41,3 +51,21 @@ def build_providers(settings: Settings, client: httpx.AsyncClient) -> tuple[Prov
             timeout=settings.timeout_seconds,
         )
     return fast, top
+
+
+async def warm_up_ollama(settings: Settings, client: httpx.AsyncClient) -> None:
+    """Load the Ollama model into memory at startup so the first user question is not the slow one."""
+    log = logging.getLogger("finpro.ai")
+    base = settings.ollama_base_url.rstrip("/").removesuffix("/v1")
+    started = time.perf_counter()
+    try:
+        res = await client.post(f"{base}/api/generate", json={"model": settings.ollama_model, "keep_alive": settings.ollama_keep_alive}, timeout=300)
+    except httpx.HTTPError as e:
+        log.warning("Ollama warm-up failed", extra={"error": f"{type(e).__name__} — is Ollama running? (`ollama serve`)", "model": settings.ollama_model})
+        return
+    if res.status_code == 404:
+        log.warning("Ollama model not found", extra={"model": settings.ollama_model, "fix": f"ollama pull {settings.ollama_model}"})
+    elif res.status_code >= 400:
+        log.warning("Ollama warm-up failed", extra={"status": res.status_code, "model": settings.ollama_model})
+    else:
+        log.info("Ollama model loaded", extra={"model": settings.ollama_model, "seconds": round(time.perf_counter() - started, 1)})

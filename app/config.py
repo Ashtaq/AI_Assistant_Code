@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     fast_provider: Literal["ollama", "hosted", "none"] | None = None
     ollama_base_url: str = Field("http://127.0.0.1:11434/v1", validation_alias="OLLAMA_BASE_URL")
     ollama_model: str = Field("qwen3:8b", validation_alias="OLLAMA_MODEL")
+    # Longest silence allowed from Ollama (loading the model counts). Streaming has no cap on total length.
+    ollama_timeout_seconds: float = Field(180, gt=0, le=900)
+    ollama_think: bool = False  # Qwen3 step-by-step "thinking": better on hard questions, much slower on a laptop
+    ollama_keep_alive: str = "30m"  # how long Ollama keeps the model in memory after the warm-up
     hosted_name: str = "hosted"
     hosted_base_url: str | None = None
     hosted_api_key: str | None = None

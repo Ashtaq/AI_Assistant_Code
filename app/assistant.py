@@ -1,4 +1,7 @@
-"""Core orchestration: prompt → route → redact → cache → call model (with fallback) → restore."""
+"""Core orchestration: prompt → route → redact → cache → call model (with fallback) → restore.
+
+`chat()` returns the whole answer at once; `stream()` yields it token by token. Both share `prepare()`.
+"""
 
 from __future__ import annotations
 
@@ -6,16 +9,21 @@ import hashlib
 import json
 import logging
 import time
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 
 from .agents import get_agent, system_prompt
 from .config import Settings
 from .limits import DailyBudget, TTLCache
 from .providers import Completion, Provider, ProviderError
 from .redact import Redactor
-from .router import Tier, route
+from .router import RouteDecision, Tier, route
 from .schemas import ChatRequest, ChatResponse, Document, RouteInfo, Usage
+from .streaming import PlaceholderBuffer, ThinkFilter
 
 log = logging.getLogger("finpro.ai")
+
+EMPTY_ANSWER = "The model returned an empty response. Please rephrase the question or try again."
 
 
 class ServiceError(Exception):
@@ -50,6 +58,27 @@ def build_document_block(documents: list[Document], budget: int) -> tuple[str, l
     return "\n".join(parts), notes
 
 
+@dataclass
+class Prepared:
+    org: str
+    agent_id: str
+    system: str
+    messages: list[dict]
+    decision: RouteDecision
+    plan: list[tuple[Provider, Tier]]
+    notes: list[str]
+    started: float
+    redactor: Redactor = field(default_factory=Redactor)
+    _redacted: list[dict] | None = None
+
+    def outgoing(self, provider: Provider, redact: bool) -> list[dict]:
+        if not redact or provider.local:
+            return self.messages
+        if self._redacted is None:
+            self._redacted = [{"role": m["role"], "content": self.redactor.redact(m["content"])} for m in self.messages]
+        return self._redacted
+
+
 class Assistant:
     def __init__(self, settings: Settings, fast: Provider | None, top: Provider | None):
         self.settings = settings
@@ -64,17 +93,16 @@ class Assistant:
 
         return {"fast": info(self.fast), "top": info(self.top)}
 
-    async def chat(self, req: ChatRequest) -> ChatResponse:
-        started = time.perf_counter()
+    # --- shared ---------------------------------------------------------------------
+
+    def prepare(self, req: ChatRequest) -> Prepared:
+        """Build the prompt and decide which models to try. Raises ServiceError before any model call."""
         s = self.settings
-        org = req.context.org_id
         agent = get_agent(req.agent_id)
         system = system_prompt(agent, user_role=req.context.user_role, project_name=req.context.project_name, client_name=req.context.client_name)
-
         doc_block, notes = build_document_block(req.documents, s.max_context_chars)
         messages = [{"role": m.role, "content": m.content} for m in req.history]
         messages.append({"role": "user", "content": f"{req.message}\n\n<attached_documents>\n{doc_block}\n</attached_documents>"})
-
         decision = route(
             message=req.message,
             agent=agent,
@@ -84,76 +112,134 @@ class Assistant:
             routing_mode=s.routing_mode,
             threshold=s.complex_threshold,
         )
-        plan = self._plan(decision.tier, org, notes)
+        plan = self._plan(decision.tier, req.context.org_id, notes)
+        return Prepared(req.context.org_id, agent.id, system, messages, decision, plan, notes, time.perf_counter())
 
-        redactor = Redactor()
-        redacted: list[dict] | None = None
+    def _max_tokens(self, tier: Tier) -> int:
+        return self.settings.top_max_output_tokens if tier == "top" else self.settings.max_output_tokens
+
+    def _finish(self, p: Prepared, provider: Provider, tier: Tier, completion: Completion, *, cached: bool, attempt: int, redacted: bool) -> ChatResponse:
+        if tier == "top" and not cached:
+            self.budget.spend(p.org)
+        latency = int((time.perf_counter() - p.started) * 1000)
+        redacted_items = p.redactor.count if redacted else 0
+        log.info(
+            "chat",
+            extra={
+                "org_id": p.org,
+                "agent": p.agent_id,
+                "tier": tier,
+                "provider": provider.name,
+                "model": completion.model,
+                "route_score": p.decision.score,
+                "route_mode": p.decision.mode,
+                "input_tokens": completion.input_tokens,
+                "output_tokens": completion.output_tokens,
+                "latency_ms": latency,
+                "cached": cached,
+                "fallback": attempt > 0,
+                "redacted": redacted_items,
+            },
+        )
+        return ChatResponse(
+            content=p.redactor.restore(completion.text) or EMPTY_ANSWER,
+            limitations=" ".join(dict.fromkeys(p.notes)) or None,
+            tier=tier,
+            provider=provider.name,
+            model=completion.model,
+            route=RouteInfo(mode=p.decision.mode, score=p.decision.score, reasons=p.decision.reasons),
+            usage=Usage(input_tokens=completion.input_tokens, output_tokens=completion.output_tokens),
+            latency_ms=latency,
+            cached=cached,
+            fallback_used=attempt > 0,
+            redacted_items=redacted_items,
+        )
+
+    def _failed(self, p: Prepared, provider: Provider, tier: Tier, e: ProviderError, attempt: int) -> None:
+        log.warning("model call failed", extra={"org_id": p.org, "provider": provider.name, "tier": tier, "error": e.detail})
+        if attempt + 1 < len(p.plan):
+            p.notes.append(f"The {tier} model was unavailable, so a backup model answered.")
+
+    # --- whole answer ---------------------------------------------------------------
+
+    async def chat(self, req: ChatRequest) -> ChatResponse:
+        p = self.prepare(req)
+        s = self.settings
         last_error: ProviderError | None = None
-        for i, (provider, tier) in enumerate(plan):
-            outgoing = messages
-            if s.redact_pii and not provider.local:
-                if redacted is None:
-                    redacted = [{"role": m["role"], "content": redactor.redact(m["content"])} for m in messages]
-                outgoing = redacted
-            max_tokens = s.top_max_output_tokens if tier == "top" else s.max_output_tokens
-
-            key = self._cache_key(org, provider, system, outgoing, max_tokens)
+        for i, (provider, tier) in enumerate(p.plan):
+            outgoing = p.outgoing(provider, s.redact_pii)
+            key = self._cache_key(p.org, provider, p.system, outgoing, self._max_tokens(tier))
             hit = self.cache.get(key)
-            cached = hit is not None
+            if hit:
+                return self._finish(p, provider, tier, hit[0], cached=True, attempt=i, redacted=outgoing is not p.messages)
             try:
-                if hit:
-                    completion, _ = hit
-                else:
-                    completion = await provider.complete(system, outgoing, max_tokens, s.temperature)
+                completion = await provider.complete(p.system, outgoing, self._max_tokens(tier), s.temperature)
             except ProviderError as e:
                 last_error = e
-                log.warning("model call failed", extra={"org_id": org, "provider": provider.name, "tier": tier, "error": e.detail})
-                if i + 1 < len(plan):
-                    notes.append(f"The {tier} model was unavailable, so a backup model answered.")
+                self._failed(p, provider, tier, e, i)
+                continue
+            if completion.text:
+                self.cache.set(key, (completion, tier))
+            return self._finish(p, provider, tier, completion, cached=False, attempt=i, redacted=outgoing is not p.messages)
+        raise ServiceError(502, f"All AI models failed for this request ({last_error.detail if last_error else 'no provider'}).")
+
+    # --- streamed answer ------------------------------------------------------------
+
+    async def stream(self, p: Prepared) -> AsyncIterator[tuple[str, dict]]:
+        """Yield ("meta" | "delta" | "done" | "error", data). Falls back to the next model only before any text was sent."""
+        s = self.settings
+        last_error: ProviderError | None = None
+        for i, (provider, tier) in enumerate(p.plan):
+            outgoing = p.outgoing(provider, s.redact_pii)
+            redacted = outgoing is not p.messages
+            max_tokens = self._max_tokens(tier)
+            yield "meta", {"tier": tier, "provider": provider.name, "model": provider.model, "fallback_used": i > 0}
+
+            key = self._cache_key(p.org, provider, p.system, outgoing, max_tokens)
+            hit = self.cache.get(key)
+            if hit:
+                answer = self._finish(p, provider, tier, hit[0], cached=True, attempt=i, redacted=redacted)
+                yield "delta", {"text": answer.content}
+                yield "done", answer.model_dump()
+                return
+
+            think, placeholders = ThinkFilter(), PlaceholderBuffer(p.redactor)
+            parts: list[str] = []
+            sent = False
+            model, tokens_in, tokens_out = provider.model, None, None
+            try:
+                async for chunk in provider.stream(p.system, outgoing, max_tokens, s.temperature):
+                    model = chunk.model or model
+                    tokens_in = chunk.input_tokens if chunk.input_tokens is not None else tokens_in
+                    tokens_out = chunk.output_tokens if chunk.output_tokens is not None else tokens_out
+                    if chunk.text:
+                        clean = think.feed(chunk.text)
+                        parts.append(clean)
+                        out = placeholders.feed(clean)
+                        if out:
+                            sent = True
+                            yield "delta", {"text": out}
+                tail = think.flush()
+                parts.append(tail)
+                out = placeholders.feed(tail) + placeholders.flush()
+                if out:
+                    yield "delta", {"text": out}
+            except ProviderError as e:
+                last_error = e
+                self._failed(p, provider, tier, e, i)
+                if sent:  # part of the answer is already on screen; do not mix in another model
+                    yield "error", {"error": f"The answer was interrupted ({e.detail}).", "partial": True}
+                    return
                 continue
 
-            if not completion.text:
-                completion.text = "The model returned an empty response. Please rephrase the question or try again."
-            elif not cached:
+            completion = Completion(text="".join(parts).strip(), model=model, input_tokens=tokens_in, output_tokens=tokens_out)
+            if completion.text:
                 self.cache.set(key, (completion, tier))
-            if tier == "top" and not cached:
-                self.budget.spend(org)
+            yield "done", self._finish(p, provider, tier, completion, cached=False, attempt=i, redacted=redacted).model_dump()
+            return
+        yield "error", {"error": f"All AI models failed for this request ({last_error.detail if last_error else 'no provider'})."}
 
-            latency = int((time.perf_counter() - started) * 1000)
-            log.info(
-                "chat",
-                extra={
-                    "org_id": org,
-                    "agent": agent.id,
-                    "tier": tier,
-                    "provider": provider.name,
-                    "model": completion.model,
-                    "route_score": decision.score,
-                    "route_mode": decision.mode,
-                    "input_tokens": completion.input_tokens,
-                    "output_tokens": completion.output_tokens,
-                    "latency_ms": latency,
-                    "cached": cached,
-                    "fallback": i > 0,
-                    "redacted": redactor.count,
-                },
-            )
-            return ChatResponse(
-                content=redactor.restore(completion.text),
-                limitations=" ".join(dict.fromkeys(notes)) or None,
-                tier=tier,
-                provider=provider.name,
-                model=completion.model,
-                route=RouteInfo(mode=decision.mode, score=decision.score, reasons=decision.reasons),
-                usage=Usage(input_tokens=completion.input_tokens, output_tokens=completion.output_tokens),
-                latency_ms=latency,
-                cached=cached,
-                fallback_used=i > 0,
-                redacted_items=redactor.count if outgoing is redacted else 0,
-            )
-
-        detail = last_error.detail if last_error else "no provider"
-        raise ServiceError(502, f"All AI models failed for this request ({detail}).")
+    # --- helpers --------------------------------------------------------------------
 
     def _plan(self, wanted: Tier, org: str, notes: list[str]) -> list[tuple[Provider, Tier]]:
         top_ok = self.top is not None and self.budget.available(org)

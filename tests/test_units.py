@@ -194,3 +194,98 @@ def test_settings_valid_production():
         top_api_key="k2",
     )
     assert s.fast_provider == "hosted" and s.is_prod
+
+
+# --- streaming providers -----------------------------------------------------------
+
+
+def test_openai_compat_streams_and_adds_no_think_for_qwen3():
+    seen = {}
+
+    def handler(req: httpx.Request):
+        seen["body"] = json.loads(req.content)
+        sse = (
+            'data: {"model":"qwen3:8b","choices":[{"delta":{"content":"Hel"}}]}\n\n'
+            'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+            'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2}}\n\n'
+            "data: [DONE]\n\n"
+        )
+        return httpx.Response(200, text=sse, headers={"content-type": "text/event-stream"})
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            p = OpenAICompatProvider(name="ollama", base_url="http://x/v1", model="qwen3:8b", local=True, client=client, no_think=True)
+            return [c async for c in p.stream("sys", [{"role": "user", "content": "hi"}], 50, 0.2)]
+
+    out = run(go())
+    assert "".join(c.text or "" for c in out) == "Hello"
+    assert out[-1].input_tokens == 7 and out[-1].output_tokens == 2
+    assert seen["body"]["stream"] is True
+    assert seen["body"]["messages"][-1]["content"].endswith("/no_think")
+
+
+def test_no_think_only_for_qwen3():
+    async def go():
+        async with httpx.AsyncClient() as client:
+            return OpenAICompatProvider(name="ollama", base_url="http://x/v1", model="llama3.2", client=client, no_think=True)
+
+    p = run(go())
+    assert p._body("s", [{"role": "user", "content": "hi"}], 10, 0, stream=False)["messages"][-1]["content"] == "hi"
+
+
+def test_ollama_timeout_is_not_retried_and_explains_fix():
+    n = []
+
+    def handler(req):
+        n.append(1)
+        raise httpx.ReadTimeout("slow", request=req)
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            p = OpenAICompatProvider(name="ollama", base_url="http://x/v1", model="qwen3:8b", local=True, client=client, retry_timeouts=False, retry_backoff=0)
+            await p.complete("s", [{"role": "user", "content": "q"}], 10, 0)
+
+    with pytest.raises(ProviderError) as e:
+        run(go())
+    assert len(n) == 1 and "qwen3:4b" in e.value.detail
+
+
+def test_anthropic_stream_parsing():
+    def handler(req: httpx.Request):
+        assert json.loads(req.content)["stream"] is True
+        lines = [
+            'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":9}}}',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi "}}',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"there"}}',
+            'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":3}}',
+            'event: message_stop\ndata: {"type":"message_stop"}',
+        ]
+        return httpx.Response(200, text="\n\n".join(lines) + "\n\n")
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            p = AnthropicProvider(api_key="k", model="claude-opus-5-5", client=client)
+            return [c async for c in p.stream("sys", [{"role": "user", "content": "a"}], 50, 0.2)]
+
+    out = run(go())
+    assert "".join(c.text or "" for c in out) == "Hi there"
+    assert out[0].input_tokens == 9 and out[-1].output_tokens == 3
+
+
+def test_warm_up_loads_model():
+    from app.providers import warm_up_ollama
+
+    seen = {}
+
+    def handler(req: httpx.Request):
+        seen["url"] = str(req.url)
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"done": True})
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await warm_up_ollama(Settings(_env_file=None, env="development"), client)
+
+    run(go())
+    assert seen["url"] == "http://127.0.0.1:11434/api/generate"
+    assert seen["body"] == {"model": "qwen3:8b", "keep_alive": "30m"}

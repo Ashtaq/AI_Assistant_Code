@@ -39,6 +39,8 @@ cp .env.example .env
 
 Check it: http://127.0.0.1:8090/health — interactive API docs at http://127.0.0.1:8090/docs (development only).
 
+On startup the service loads the Ollama model into memory (warm-up), so the first question is not the slow one. Qwen3's long "thinking" step is switched off by default (`AI_OLLAMA_THINK=false`) — on a MacBook it can take minutes. On an 8 GB Mac use `qwen3:4b`.
+
 Optional in development: set `AI_TOP_PROVIDER=anthropic` and `AI_TOP_API_KEY` in `.env` to try the top tier; without it, complex questions are answered by Ollama with a note.
 
 ### Connect Finpro
@@ -70,11 +72,12 @@ The cache and daily budget are in memory (per container, reset on restart). Move
 
 ## API
 
-| Method | Path         | Auth   | Purpose                                         |
-| ------ | ------------ | ------ | ----------------------------------------------- |
-| GET    | `/health`    | none   | Status, environment and configured tiers/models |
-| GET    | `/v1/agents` | Bearer | Agent ids and names                             |
-| POST   | `/v1/chat`   | Bearer | Answer a question                               |
+| Method | Path              | Auth   | Purpose                                         |
+| ------ | ----------------- | ------ | ----------------------------------------------- |
+| GET    | `/health`         | none   | Status, environment and configured tiers/models |
+| GET    | `/v1/agents`      | Bearer | Agent ids and names                             |
+| POST   | `/v1/chat`        | Bearer | Answer a question (whole answer at once)        |
+| POST   | `/v1/chat/stream` | Bearer | Answer as Server-Sent Events (token by token)   |
 
 `POST /v1/chat` request:
 
@@ -91,6 +94,8 @@ The cache and daily budget are in memory (per container, reset on restart). Move
   "complexity": "auto"
 }
 ```
+
+`POST /v1/chat/stream` takes the same body and sends SSE events: `meta` (`tier`, `provider`, `model`), `delta` (`text`), then `done` (the full response below) or `error` (`error`, `partial`). `: ping` comments keep the connection alive while the model is loading. Closing the connection stops the model, so a **Stop** button in the client really stops generation. If a model fails before sending any text the next tier takes over; once text has been sent it never switches model mid-answer.
 
 Response: `content`, `limitations`, `tier` (`fast`/`top`), `provider`, `model`, `route` (`mode`, `score`, `reasons`), `usage` (tokens), `latency_ms`, `cached`, `fallback_used`, `redacted_items`. Errors: `{ "error": "…" }` with 401, 422, 502 or 503.
 
