@@ -39,7 +39,7 @@ cp .env.example .env
 
 Check it: http://127.0.0.1:8090/health — interactive API docs at http://127.0.0.1:8090/docs (development only).
 
-On startup the service loads the Ollama model into memory (warm-up), so the first question is not the slow one. Qwen3's long "thinking" step is switched off by default (`AI_OLLAMA_THINK=false`) — on a MacBook it can take minutes. On an 8 GB Mac use `qwen3:4b`.
+On startup the service loads the Ollama model into memory (warm-up), so the first question is not the slow one. Ollama is called through its native `/api/chat` API so Qwen3's long "thinking" step can be switched off (`think: false`, default `AI_OLLAMA_THINK=false`) — on a MacBook it can take minutes. On an 8 GB Mac use `qwen3:4b` (or `qwen3:1.7b` if that is still slow).
 
 Optional in development: set `AI_TOP_PROVIDER=anthropic` and `AI_TOP_API_KEY` in `.env` to try the top tier; without it, complex questions are answered by Ollama with a note.
 

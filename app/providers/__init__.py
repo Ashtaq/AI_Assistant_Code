@@ -10,6 +10,7 @@ import httpx
 from ..config import Settings
 from .anthropic import AnthropicProvider
 from .base import Completion, Provider, ProviderError
+from .ollama import OllamaProvider
 from .openai_compat import OpenAICompatProvider
 
 __all__ = ["Completion", "Provider", "ProviderError", "build_providers", "warm_up_ollama"]
@@ -18,15 +19,13 @@ __all__ = ["Completion", "Provider", "ProviderError", "build_providers", "warm_u
 def build_providers(settings: Settings, client: httpx.AsyncClient) -> tuple[Provider | None, Provider | None]:
     fast: Provider | None = None
     if settings.fast_provider == "ollama":
-        fast = OpenAICompatProvider(
-            name="ollama",
+        fast = OllamaProvider(
             base_url=settings.ollama_base_url,
             model=settings.ollama_model,
-            local=True,
             client=client,
             timeout=settings.ollama_timeout_seconds,
-            retry_timeouts=False,  # a slow local model will not get faster on a second try
-            no_think=not settings.ollama_think,
+            think=settings.ollama_think,
+            keep_alive=settings.ollama_keep_alive,
         )
     elif settings.fast_provider == "hosted":
         fast = OpenAICompatProvider(

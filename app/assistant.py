@@ -186,7 +186,7 @@ class Assistant:
     # --- streamed answer ------------------------------------------------------------
 
     async def stream(self, p: Prepared) -> AsyncIterator[tuple[str, dict]]:
-        """Yield ("meta" | "delta" | "done" | "error", data). Falls back to the next model only before any text was sent."""
+        """Yield ("meta" | "status" | "delta" | "done" | "error", data). Falls back to the next model only before any text was sent."""
         s = self.settings
         last_error: ProviderError | None = None
         for i, (provider, tier) in enumerate(p.plan):
@@ -206,12 +206,16 @@ class Assistant:
             think, placeholders = ThinkFilter(), PlaceholderBuffer(p.redactor)
             parts: list[str] = []
             sent = False
+            told_thinking = False
             model, tokens_in, tokens_out = provider.model, None, None
             try:
                 async for chunk in provider.stream(p.system, outgoing, max_tokens, s.temperature):
                     model = chunk.model or model
                     tokens_in = chunk.input_tokens if chunk.input_tokens is not None else tokens_in
                     tokens_out = chunk.output_tokens if chunk.output_tokens is not None else tokens_out
+                    if chunk.thinking and not told_thinking:
+                        told_thinking = True
+                        yield "status", {"phase": "thinking"}
                     if chunk.text:
                         clean = think.feed(chunk.text)
                         parts.append(clean)

@@ -172,3 +172,18 @@ def test_disconnect_under_anyio_cancellation_lets_the_model_call_clean_up():
 
     asyncio.run(go())
     assert closed.is_set()
+
+
+def test_stream_reports_thinking_once(build):
+    from app.providers.base import StreamChunk
+
+    class Thinker(FakeProvider):
+        async def stream(self, system, messages, max_tokens, temperature):
+            for _ in range(3):
+                yield StreamChunk(thinking=True)
+            yield StreamChunk(text="Answer.")
+
+    client, _ = build(fast=Thinker("ollama", local=True), top=None, top_provider="none")
+    events = stream(client, body("why?"))
+    assert [e for e, _ in events].count("status") == 1
+    assert text_of(events) == "Answer."

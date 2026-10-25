@@ -289,3 +289,75 @@ def test_warm_up_loads_model():
     run(go())
     assert seen["url"] == "http://127.0.0.1:11434/api/generate"
     assert seen["body"] == {"model": "qwen3:8b", "keep_alive": "30m"}
+
+
+# --- native Ollama provider --------------------------------------------------------
+
+
+def test_ollama_native_stream_disables_thinking_and_parses_ndjson():
+    from app.providers.ollama import OllamaProvider
+
+    seen = {}
+
+    def handler(req: httpx.Request):
+        seen["url"] = str(req.url)
+        seen["body"] = json.loads(req.content)
+        lines = [
+            {"message": {"role": "assistant", "content": "", "thinking": "hmm"}, "done": False},
+            {"message": {"role": "assistant", "content": "Tax "}, "done": False},
+            {"message": {"role": "assistant", "content": "is a levy."}, "done": False},
+            {"model": "qwen3:4b", "message": {"role": "assistant", "content": ""}, "done": True, "prompt_eval_count": 12, "eval_count": 4},
+        ]
+        return httpx.Response(200, text="\n".join(json.dumps(x) for x in lines) + "\n")
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            p = OllamaProvider(base_url="http://127.0.0.1:11434/v1", model="qwen3:4b", client=client)
+            return [c async for c in p.stream("sys", [{"role": "user", "content": "what is tax?"}], 300, 0.2)]
+
+    out = run(go())
+    assert seen["url"] == "http://127.0.0.1:11434/api/chat"
+    b = seen["body"]
+    assert b["think"] is False and b["stream"] is True and b["keep_alive"] == "30m"
+    assert b["options"] == {"num_predict": 300, "temperature": 0.2}
+    assert b["messages"][0] == {"role": "system", "content": "sys"}
+    assert out[0].thinking is True
+    assert "".join(c.text or "" for c in out) == "Tax is a levy."
+    assert out[-1].input_tokens == 12 and out[-1].output_tokens == 4 and out[-1].model == "qwen3:4b"
+
+
+def test_ollama_native_errors_explain_the_fix():
+    from app.providers.ollama import OllamaProvider
+
+    def not_found(req):
+        return httpx.Response(404, json={"error": "model 'qwen3:4b' not found"})
+
+    def slow(req):
+        raise httpx.ReadTimeout("slow", request=req)
+
+    async def go(handler):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            p = OllamaProvider(base_url="http://x/v1", model="qwen3:4b", client=client)
+            return [c async for c in p.stream("s", [{"role": "user", "content": "q"}], 10, 0)]
+
+    with pytest.raises(ProviderError) as e:
+        run(go(not_found))
+    assert "ollama pull qwen3:4b" in e.value.detail
+    with pytest.raises(ProviderError) as e:
+        run(go(slow))
+    assert e.value.kind == "timeout" and "smaller model" in e.value.detail
+
+
+def test_ollama_native_complete():
+    from app.providers.ollama import OllamaProvider
+
+    def handler(req):
+        assert json.loads(req.content)["stream"] is False
+        return httpx.Response(200, json={"model": "llama3.2", "message": {"content": "<think>x</think>Hi"}, "prompt_eval_count": 3, "eval_count": 1})
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await OllamaProvider(base_url="http://x", model="llama3.2", client=client).complete("s", [{"role": "user", "content": "q"}], 10, 0)
+
+    c = run(go())
+    assert c.text == "Hi" and c.input_tokens == 3

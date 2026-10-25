@@ -28,6 +28,7 @@ class StreamChunk:
     model: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    thinking: bool = False  # the model is reasoning (no answer text yet)
 
 
 class ProviderError(Exception):
