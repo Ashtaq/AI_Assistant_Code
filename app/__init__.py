@@ -1,0 +1,1 @@
+"""Finpro AI Assistant service."""

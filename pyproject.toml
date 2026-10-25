@@ -1,0 +1,19 @@
+[project]
+name = "finpro-ai-assistant"
+version = "1.0.0"
+description = "Finpro AI Assistant service: model routing between Ollama / hosted open-source models and a top model"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
+filterwarnings = ["ignore:Using `httpx` with"]
+
+[tool.ruff]
+line-length = 160
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+ignore = ["B008", "E501"]
